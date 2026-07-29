@@ -1,0 +1,4 @@
+name: astrbot_plugin_sticker_convert
+author: Author
+version: 1.0.6
+description: QQ表情转存与提取，支持内存直发纯文件卡片
