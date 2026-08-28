@@ -76,6 +76,8 @@ class StickerConvert(Star):
                     append_images=frames[1:],
                     duration=durations,
                     loop=loop,
+                    disposal=2,
+                    optimize=False,
                 )
                 return output.getvalue()
         except Exception as exc:
