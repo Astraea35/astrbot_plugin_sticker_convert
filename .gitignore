@@ -3,3 +3,6 @@
 upload.bat
 upload.py
 上传GitHub.py
+__pycache__/
+*.pyc
+data/

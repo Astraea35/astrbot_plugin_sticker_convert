@@ -1,7 +1,7 @@
 name: astrbot_plugin_sticker_convert
-desc: "QQ表情转存与提取，支持内存直发纯文件卡片"
-help: "QQ表情/贴纸转换提取工具，发送或回复表情即可触发转存处理。"
-version: "1.0.7"
+desc: "QQ表情转存与提取，支持内存直发纯文件卡片，私聊自动转文件，动态 WebP 自动转 GIF"
+help: "QQ表情/贴纸转换提取工具，支持私聊收到表情包自动转文件，或发送/回复表情触发转存处理。"
+version: "1.0.8"
 author: "Astraea35"
 repo: https://github.com/Astraea35/astrbot_plugin_sticker_convert
 display_name: "QQ表情转存工具"

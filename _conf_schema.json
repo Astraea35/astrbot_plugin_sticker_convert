@@ -1,0 +1,14 @@
+{
+  "auto_convert_private": {
+    "type": "bool",
+    "description": "私聊收到表情包自动转换为文件",
+    "hint": "开启后，在私聊中收到表情包或图片时自动转换为文件卡片发出，无需手动输入指令。",
+    "default": false
+  },
+  "convert_animated_webp_to_gif": {
+    "type": "bool",
+    "description": "动态 WebP 转为 GIF",
+    "hint": "沿用设定：若表情包为动态 WebP 格式，是否自动转换为 GIF 格式文件发送。",
+    "default": true
+  }
+}
