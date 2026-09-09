@@ -11,13 +11,14 @@ from datetime import datetime
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Image, Plain, Reply
+from astrbot.api import logger
 
 try:
     from PIL import Image as PILImage
 except ImportError:
     PILImage = None
 
-@register("sticker_convert", "Astraea35", "QQ表情转存与文件提取插件", "1.0.9", "将QQ表情转存并以纯文件格式发送，支持私聊自动转文件，动态 WebP 自动转 GIF")
+@register("sticker_convert", "Astraea35", "QQ表情转存与文件提取插件", "1.1.0", "将QQ表情转存并以纯文件格式发送，支持私聊表情包/动图自动转文件，静态自定义表情精准识别，动态 WebP 自动转 GIF")
 class StickerConvert(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -89,7 +90,7 @@ class StickerConvert(Star):
                 )
                 return output.getvalue()
         except Exception as exc:
-            print(f"[StickerConvert] 动态 WebP 转 GIF 失败，保留原文件: {exc}")
+            logger.warning(f"[StickerConvert] 动态 WebP 转 GIF 失败，保留原文件: {exc}")
             return None
 
     async def _download_image(self, url: str):
@@ -120,6 +121,25 @@ class StickerConvert(Star):
                     
                 return buffer, mime, ext
 
+    def _is_animated_webp(self, buffer: bytes) -> bool:
+        """判断 WebP 图片是否为动图（多帧）"""
+        if not buffer or len(buffer) < 21:
+            return False
+        # 1. 优先使用 Pillow 检测
+        if PILImage is not None:
+            try:
+                with PILImage.open(BytesIO(buffer)) as img:
+                    return bool(getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1)
+            except Exception:
+                pass
+        # 2. 备选方案：检查 WebP 规范中的 Extended header VP8X 动画标识位
+        try:
+            if buffer[0:4] == b"RIFF" and buffer[8:12] == b"WEBP" and buffer[12:16] == b"VP8X":
+                return bool(buffer[20] & 0x02)
+        except Exception:
+            pass
+        return False
+
     def _is_animated_image(self, buffer: bytes, mime: str = "", ext: str = "") -> bool:
         """判断图片是否为动图（GIF、动态 WebP、APNG 等）"""
         if not buffer:
@@ -129,8 +149,7 @@ class StickerConvert(Star):
             return True
         # 2. 动态 WebP
         if buffer[0:4] == b"RIFF" and buffer[8:12] == b"WEBP":
-            if self._is_animated_webp(buffer):
-                return True
+            return self._is_animated_webp(buffer)
         # 3. APNG 或通用 Pillow 动图检查
         if PILImage is not None:
             try:
@@ -140,6 +159,46 @@ class StickerConvert(Star):
             except Exception:
                 pass
         return False
+
+    def _is_valid_sticker(self, buffer: bytes, mime: str, ext: str, is_sticker_meta: bool) -> tuple[bool, str]:
+        """综合判定该图片是否属于“无法直接保存至相册的表情包”
+        返回: (is_sticker: bool, reason: str)
+        1. 动图 (GIF、动态 WebP、APNG): 在 QQ 中一律作为动图表情呈现，无法直接保存至相册 -> 认定为表情包
+        2. 带表情包元数据 (mface、sub_type=1、带[动画表情]摘要等) -> 认定为表情包
+        3. 静态图片尺寸与体积判定 (覆盖用户收藏的静态表情、静态咖波、熊猫头梗图等):
+           QQ 中用户收藏的表情包尺寸普遍较小 (通常 <= 800px，绝大部分在 200~500px，且体积 <= 2MB)。
+           而相机拍摄的照片、手机截屏等通常为大图 (1080x1920, 2400x1080, 3000x4000 等)。
+           当静态图片长边 <= max_sticker_dimension (默认 800) 且体积 <= 2MB 时，认定为静态表情包；
+           超过阈值则判定为普通照片/手机截屏，予以跳过。
+        """
+        # 1. 动图判断
+        if self._is_animated_image(buffer, mime, ext):
+            return True, "动图表情(GIF/动态WebP/APNG)"
+
+        # 2. 表情包元数据判断
+        if is_sticker_meta:
+            return True, "包含表情包元数据(mface/sub_type/表情摘要)"
+
+        # 3. 静态图片尺寸与体积启发式检测
+        max_dim_threshold = int(self.config.get("max_sticker_dimension", 800))
+        max_size_bytes = int(self.config.get("max_sticker_bytes", 2 * 1024 * 1024))
+
+        if len(buffer) > max_size_bytes:
+            return False, f"静态图片文件体积过大 ({round(len(buffer)/1024/1024, 2)}MB > {round(max_size_bytes/1024/1024, 2)}MB)"
+
+        if PILImage is not None:
+            try:
+                with PILImage.open(BytesIO(buffer)) as img:
+                    w, h = img.size
+                    max_dim = max(w, h)
+                    if max_dim <= max_dim_threshold:
+                        return True, f"静态表情包 (尺寸 {w}x{h} <= {max_dim_threshold}px)"
+                    else:
+                        return False, f"普通大图/截屏 (尺寸 {w}x{h} > {max_dim_threshold}px)"
+            except Exception as exc:
+                logger.warning(f"[StickerConvert] Pillow 解析静态图片尺寸失败: {exc}")
+
+        return False, "静态图片且无表情元数据"
 
     def _extract_image_items_from_current_msg(self, event: AstrMessageEvent) -> list[dict]:
         """从单条消息组件链及 raw_message 中提取图片/表情信息，精确区分普通图片与表情包元数据。
@@ -152,6 +211,9 @@ class StickerConvert(Star):
             if u and isinstance(u, str):
                 u = u.strip()
                 if u.startswith("http://") or u.startswith("https://"):
+                    u_lower = u.lower()
+                    if any(k in u_lower for k in ("subtype=1", "term=2", "custom_face", "offpic")):
+                        is_sticker_meta = True
                     if u not in items_map:
                         items_map[u] = is_sticker_meta
                     else:
@@ -293,7 +355,7 @@ class StickerConvert(Star):
                             matches = re.findall(r'\[CQ:(?:image|mface|marketface).*?url=([^,\]]+)', msg_data, re.I)
                             urls.extend(matches)
                 except Exception as e:
-                    print(f"[StickerConvert] 引用详情获取失败: {e}")
+                    logger.warning(f"[StickerConvert] 引用详情获取失败: {e}")
 
                 if urls:
                     return urls
@@ -343,7 +405,7 @@ class StickerConvert(Star):
                     await event.bot.api.call_action('upload_private_file', user_id=int(user_id), file=b64_uri, name=file_name)
                 return True
             except Exception as e:
-                print(f"[StickerConvert] API 文件发送失败: {e}")
+                logger.warning(f"[StickerConvert] API 文件发送失败: {e}")
                 return False
         return False
 
@@ -379,6 +441,7 @@ class StickerConvert(Star):
             if msg_str.startswith(("/", "／", "!", "！")):
                 return
 
+            logger.info(f"[StickerConvert] 收到私聊消息 (sender={sender_id}, msg_id={msg_id})，分析 {len(items)} 个候选图片/表情")
             converted_urls = set()
             # 逐张检测并转换为文件卡片
             for item in items:
@@ -388,27 +451,25 @@ class StickerConvert(Star):
                 try:
                     buffer, mime, ext = await self._download_image(url)
 
-                    # 判断是否属于“无法直接保存至相册的表情包”：
-                    # A. 带有表情包元数据（QQ商城/动画表情 mface、收藏的表情 sub_type=1、带[动画表情]等）
-                    # B. 图片内容为动图（GIF 或动态 WebP 或 APNG）：在 QQ 中动图（即使未收藏或从相册发出）均无法保存至相册
-                    is_animated = self._is_animated_image(buffer, mime, ext)
-
-                    if not (is_sticker_meta or is_animated):
-                        # 既不是表情包元数据，也不是动图 -> 属于普通静态图片/照片（在 QQ 中可直接长按保存到相册）
-                        # 严格遵守需求：普通静态图片与文件不进行自动转换与转发！
+                    # 综合判断是否属于“无法直接保存至相册的表情包”（动图/表情包元数据/小尺寸静态表情包）
+                    is_sticker, reason = self._is_valid_sticker(buffer, mime, ext, is_sticker_meta)
+                    if not is_sticker:
+                        logger.info(f"[StickerConvert] 跳过非表情包图片: {reason} (url={url[:60]}...)")
                         continue
 
                     md5 = hashlib.md5(buffer).hexdigest()
                     file_name = f"emoji_{md5[:8]}.{ext}"
+                    logger.info(f"[StickerConvert] 识别为表情包 ({reason})，正在发送文件卡片: {file_name}")
 
                     async with self._send_lock:
                         success = await self._send_as_file(event, buffer, file_name)
                         if success:
                             converted_urls.add(url)
+                            logger.info(f"[StickerConvert] 自动转文件发送成功: {file_name}")
                         else:
-                            print(f"[StickerConvert] 自动转文件发送失败: {file_name}")
+                            logger.warning(f"[StickerConvert] 自动转文件发送失败: {file_name}")
                 except Exception as e:
-                    print(f"[StickerConvert] 私聊自动转换异常: {e}")
+                    logger.error(f"[StickerConvert] 私聊自动转换异常: {e}", exc_info=True)
 
             # 仅标记成功发送的表情为已使用
             if sender_id in self.recent_images and converted_urls:

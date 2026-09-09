@@ -10,5 +10,11 @@
     "description": "动态 WebP 转为 GIF",
     "hint": "沿用设定：若表情包为动态 WebP 格式，是否自动转换为 GIF 格式文件发送。",
     "default": true
+  },
+  "max_sticker_dimension": {
+    "type": "int",
+    "description": "静态表情包最大长边尺寸(像素)",
+    "hint": "长边小于等于此阈值的静态图片（如用户收藏的静态表情、咖波、表情包梗图）自动转换；大于此阈值的普通相册照片和手机截屏将被忽略。默认 800 像素。",
+    "default": 800
   }
 }
