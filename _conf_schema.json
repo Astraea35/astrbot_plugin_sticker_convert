@@ -2,7 +2,7 @@
   "auto_convert_private": {
     "type": "bool",
     "description": "私聊收到表情包自动转换为文件",
-    "hint": "开启后，在私聊中收到表情包或图片时自动转换为文件卡片发出，无需手动输入指令。",
+    "hint": "开启后，在私聊收到QQ无法直接保存至相册的表情包（QQ自带表情、收藏表情及各类动图）时自动转为文件卡片发出。普通静态照片与文件不会被自动转发。",
     "default": false
   },
   "convert_animated_webp_to_gif": {

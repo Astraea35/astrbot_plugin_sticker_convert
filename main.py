@@ -17,7 +17,7 @@ try:
 except ImportError:
     PILImage = None
 
-@register("sticker_convert", "Astraea35", "QQ表情转存与文件提取插件", "1.0.8", "将QQ表情转存并以纯文件格式发送，支持私聊自动转文件，动态 WebP 自动转 GIF")
+@register("sticker_convert", "Astraea35", "QQ表情转存与文件提取插件", "1.0.9", "将QQ表情转存并以纯文件格式发送，支持私聊自动转文件，动态 WebP 自动转 GIF")
 class StickerConvert(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -120,41 +120,44 @@ class StickerConvert(Star):
                     
                 return buffer, mime, ext
 
-    def _extract_urls_from_current_msg(self, event: AstrMessageEvent) -> list[str]:
-        """从单条消息组件链及 raw_message 中提取图片/表情 URL（兼容标准 Image 及 mface 商城表情等）"""
-        urls = []
-        seen = set()
+    def _is_animated_image(self, buffer: bytes, mime: str = "", ext: str = "") -> bool:
+        """判断图片是否为动图（GIF、动态 WebP、APNG 等）"""
+        if not buffer:
+            return False
+        # 1. GIF 格式：在 QQ 手机端与桌面端，任何 GIF 均作为表情动图展示且无法直接保存至相册
+        if buffer.startswith(b"GIF8") or mime == "image/gif" or ext == "gif":
+            return True
+        # 2. 动态 WebP
+        if buffer[0:4] == b"RIFF" and buffer[8:12] == b"WEBP":
+            if self._is_animated_webp(buffer):
+                return True
+        # 3. APNG 或通用 Pillow 动图检查
+        if PILImage is not None:
+            try:
+                with PILImage.open(BytesIO(buffer)) as img:
+                    if getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1:
+                        return True
+            except Exception:
+                pass
+        return False
 
-        def _add_url(u):
+    def _extract_image_items_from_current_msg(self, event: AstrMessageEvent) -> list[dict]:
+        """从单条消息组件链及 raw_message 中提取图片/表情信息，精确区分普通图片与表情包元数据。
+        排除 File 文件消息段，识别 mface、sub_type=1 以及带表情摘要的表情包。
+        返回: [{"url": str, "is_sticker_meta": bool}, ...]
+        """
+        items_map = {}  # url -> is_sticker_meta
+
+        def _add_item(u, is_sticker_meta=False):
             if u and isinstance(u, str):
                 u = u.strip()
-                if (u.startswith("http://") or u.startswith("https://")) and u not in seen:
-                    seen.add(u)
-                    urls.append(u)
+                if u.startswith("http://") or u.startswith("https://"):
+                    if u not in items_map:
+                        items_map[u] = is_sticker_meta
+                    else:
+                        items_map[u] = items_map[u] or is_sticker_meta
 
-        # 1. 从 AstrBot 消息组件中提取 Image
-        for comp in getattr(event.message_obj, "message", []) or []:
-            comp_type_str = str(getattr(comp, "type", "")).lower()
-            cls_name = getattr(comp, "__class__", None).__name__ if getattr(comp, "__class__", None) else ""
-            if isinstance(comp, Reply) or cls_name == "Reply" or comp_type_str.endswith("reply"):
-                continue
-
-            is_img = (
-                isinstance(comp, Image)
-                or cls_name == "Image"
-                or comp_type_str.endswith("image")
-                or bool(getattr(comp, "url", None))
-                or bool(getattr(comp, "file", None))
-            )
-            if is_img:
-                url_attr = getattr(comp, "url", None)
-                if url_attr and isinstance(url_attr, str):
-                    _add_url(url_attr)
-                file_attr = getattr(comp, "file", None)
-                if file_attr and isinstance(file_attr, str):
-                    _add_url(file_attr)
-
-        # 2. 从 OneBot 原始数据 raw_message 中提取（覆盖 mface 商城表情、未识别表情段等）
+        # 1. 优先从 OneBot 原始数据 raw_message 中提取（包含 sub_type、summary、mface 等丰富元数据）
         raw_event = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw_event, dict):
             raw_msg = raw_event.get("message")
@@ -163,18 +166,68 @@ class StickerConvert(Star):
                     if not isinstance(seg, dict):
                         continue
                     seg_type = str(seg.get("type", "")).lower()
+                    # 明确排除纯文件消息段，绝不作为表情提取转发
+                    if seg_type == "file":
+                        continue
+
                     data = seg.get("data", {})
                     if not isinstance(data, dict):
                         continue
 
                     if seg_type in ("image", "mface", "marketface", "bface", "sface"):
-                        for key in ("url", "cdnurl", "cdn_url", "raw_url", "origin_url", "original_url", "thumb", "thumb_url", "file"):
-                            _add_url(data.get(key))
-            elif isinstance(raw_msg, str):
-                for match in re.findall(r'\[CQ:(?:image|mface|marketface).*?url=([^,\]]+)', raw_msg, re.I):
-                    _add_url(match)
+                        is_mface = seg_type in ("mface", "marketface", "bface", "sface")
+                        sub_type = str(data.get("sub_type") or data.get("subType") or data.get("subtype") or "").strip()
+                        is_sub_type_sticker = sub_type in ("1", "7", "8", "9")
+                        summary = str(data.get("summary") or data.get("name") or "").strip()
+                        is_summary_sticker = any(kw in summary for kw in ("表情", "动画", "热图"))
 
-        return urls
+                        is_sticker_meta = is_mface or is_sub_type_sticker or is_summary_sticker
+
+                        for key in ("url", "cdnurl", "cdn_url", "raw_url", "origin_url", "original_url", "thumb", "thumb_url", "file"):
+                            _add_item(data.get(key), is_sticker_meta)
+            elif isinstance(raw_msg, str):
+                for match in re.finditer(r'\[CQ:(image|mface|marketface|bface|sface)(?:,([^\]]+))?\]', raw_msg, re.I):
+                    seg_type = match.group(1).lower()
+                    params_str = match.group(2) or ''
+                    params = dict(re.findall(r'([a-zA-Z0-9_-]+)=([^,\]]+)', params_str))
+                    url = params.get('url') or params.get('cdnurl') or params.get('file')
+                    sub_type = str(params.get('subType') or params.get('sub_type') or params.get('subtype') or '').strip()
+                    summary = str(params.get('summary', '')).strip()
+                    is_sticker_meta = (
+                        seg_type in ('mface', 'marketface', 'bface', 'sface')
+                        or sub_type in ('1', '7', '8', '9')
+                        or any(kw in summary for kw in ('表情', '动画', '热图'))
+                    )
+                    _add_item(url, is_sticker_meta)
+
+        # 2. 从 AstrBot 消息组件中提取 Image（排除 File 与 Reply 组件）
+        for comp in getattr(event.message_obj, "message", []) or []:
+            comp_type_str = str(getattr(comp, "type", "")).lower()
+            cls_name = getattr(comp, "__class__", None).__name__ if getattr(comp, "__class__", None) else ""
+            if isinstance(comp, Reply) or cls_name == "Reply" or comp_type_str.endswith("reply"):
+                continue
+            if cls_name == "File" or comp_type_str.endswith("file"):
+                continue
+
+            is_img = (
+                isinstance(comp, Image)
+                or cls_name == "Image"
+                or comp_type_str.endswith("image")
+                or bool(getattr(comp, "url", None))
+            )
+            if is_img:
+                url_attr = getattr(comp, "url", None)
+                if url_attr and isinstance(url_attr, str):
+                    _add_item(url_attr, False)
+                file_attr = getattr(comp, "file", None)
+                if file_attr and isinstance(file_attr, str):
+                    _add_item(file_attr, False)
+
+        return [{"url": u, "is_sticker_meta": meta} for u, meta in items_map.items()]
+
+    def _extract_urls_from_current_msg(self, event: AstrMessageEvent) -> list[str]:
+        """从单条消息组件链及 raw_message 中提取全部图片/表情 URL（兼容上层调用）"""
+        return [item["url"] for item in self._extract_image_items_from_current_msg(event)]
 
     async def _extract_image_urls(self, event: AstrMessageEvent, allow_recent: bool = True):
         """从消息、引用的历史消息或近期私聊上下文中提取图片 URL"""
@@ -296,40 +349,55 @@ class StickerConvert(Star):
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent):
-        """私聊消息监听：记录近期表情，以及可选的自动转换为文件发出"""
+        """私聊消息监听：记录近期表情，以及可选的自动将表情包/动图转换为文件发出"""
         sender_id = str(event.message_obj.sender.user_id)
         msg_id = getattr(event.message_obj, "message_id", None)
-        urls = self._extract_urls_from_current_msg(event)
+        items = self._extract_image_items_from_current_msg(event)
 
         # 1. 记录到用户近期表情缓存
-        if urls:
+        if items:
             now = time.time()
             if sender_id not in self.recent_images:
                 self.recent_images[sender_id] = []
-            for u in urls:
+            for item in items:
                 self.recent_images[sender_id].append({
-                    "url": u,
+                    "url": item["url"],
+                    "is_sticker_meta": item.get("is_sticker_meta", False),
                     "time": now,
                     "msg_id": str(msg_id) if msg_id is not None else None,
                     "used": False
                 })
             # 保留最近 30 条，清理超过 300 秒的过期记录
             self.recent_images[sender_id] = [
-                item for item in self.recent_images[sender_id] if now - item["time"] <= 300
+                r for r in self.recent_images[sender_id] if now - r["time"] <= 300
             ][-30:]
 
         # 2. 如果开启了私聊收到表情包自动转换为文件功能
-        if self.config.get("auto_convert_private", False) and urls:
+        if self.config.get("auto_convert_private", False) and items:
             # 若消息带有其他指令前缀，不进行自动转换，交给对应指令处理
             msg_str = (event.get_message_str() or "").strip()
             if msg_str.startswith(("/", "／", "!", "！")):
                 return
 
             converted_urls = set()
-            # 逐张转换并发送为文件卡片
-            for url in urls:
+            # 逐张检测并转换为文件卡片
+            for item in items:
+                url = item["url"]
+                is_sticker_meta = item.get("is_sticker_meta", False)
+
                 try:
                     buffer, mime, ext = await self._download_image(url)
+
+                    # 判断是否属于“无法直接保存至相册的表情包”：
+                    # A. 带有表情包元数据（QQ商城/动画表情 mface、收藏的表情 sub_type=1、带[动画表情]等）
+                    # B. 图片内容为动图（GIF 或动态 WebP 或 APNG）：在 QQ 中动图（即使未收藏或从相册发出）均无法保存至相册
+                    is_animated = self._is_animated_image(buffer, mime, ext)
+
+                    if not (is_sticker_meta or is_animated):
+                        # 既不是表情包元数据，也不是动图 -> 属于普通静态图片/照片（在 QQ 中可直接长按保存到相册）
+                        # 严格遵守需求：普通静态图片与文件不进行自动转换与转发！
+                        continue
+
                     md5 = hashlib.md5(buffer).hexdigest()
                     file_name = f"emoji_{md5[:8]}.{ext}"
 
@@ -342,14 +410,15 @@ class StickerConvert(Star):
                 except Exception as e:
                     print(f"[StickerConvert] 私聊自动转换异常: {e}")
 
-            # 标记成功发送的表情为已使用
+            # 仅标记成功发送的表情为已使用
             if sender_id in self.recent_images and converted_urls:
-                for item in self.recent_images[sender_id]:
-                    if item["url"] in converted_urls:
-                        item["used"] = True
+                for r_item in self.recent_images[sender_id]:
+                    if r_item["url"] in converted_urls:
+                        r_item["used"] = True
 
-            # 阻断事件继续向后传递，防止触发大模型闲聊回复
-            event.stop_event()
+            # 仅在真正发送了转换文件时，才阻断事件传递
+            if converted_urls:
+                event.stop_event()
 
     @filter.command("表情转换")
     async def convert_only(self, event: AstrMessageEvent):
