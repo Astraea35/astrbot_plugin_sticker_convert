@@ -7,10 +7,11 @@ import re
 import base64
 import time
 from io import BytesIO
+from pathlib import Path
 from datetime import datetime
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
-from astrbot.api.message_components import Image, Plain, Reply
+from astrbot.api.message_components import Image, Plain, Reply, File
 from astrbot.api import logger
 
 try:
@@ -95,31 +96,28 @@ class StickerConvert(Star):
 
     async def _download_image(self, url: str):
         """异步下载图片并返回 buffer, mime, ext"""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as response:
-                if response.status != 200:
-                    raise Exception(f"HTTP Error {response.status}")
-                buffer = await response.read()
-                
-                mime = 'image/unknown'
-                ext = 'jpg'
-                if buffer.startswith(b'\x89PNG'):
-                    mime, ext = 'image/png', 'png'
-                elif buffer.startswith(b'\xff\xd8\xff'):
-                    mime, ext = 'image/jpeg', 'jpg'
-                elif buffer.startswith(b'GIF8'):
-                    mime, ext = 'image/gif', 'gif'
-                elif buffer[0:4] == b'RIFF' and buffer[8:12] == b'WEBP':
-                    mime, ext = 'image/webp', 'webp'
-
-                    # 沿用设定：动态 WebP 自动转换为 GIF（可配置，默认开启）
-                    if self.config.get("convert_animated_webp_to_gif", True):
-                        converted = self._convert_animated_webp_to_gif(buffer)
-                        if converted is not None:
-                            buffer = converted
-                            mime, ext = 'image/gif', 'gif'
-                    
-                return buffer, mime, ext
+        if os.path.isfile(url):
+            buffer = await asyncio.to_thread(Path(url).read_bytes)
+        else:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=30) as response:
+                    if response.status != 200:
+                        raise Exception(f"HTTP Error {response.status}")
+                    buffer = await response.read()
+        mime, ext = 'image/unknown', 'jpg'
+        if buffer.startswith(b'\x89PNG'):
+            mime, ext = 'image/png', 'png'
+        elif buffer.startswith(b'\xff\xd8\xff'):
+            mime, ext = 'image/jpeg', 'jpg'
+        elif buffer.startswith(b'GIF8'):
+            mime, ext = 'image/gif', 'gif'
+        elif buffer[0:4] == b'RIFF' and buffer[8:12] == b'WEBP':
+            mime, ext = 'image/webp', 'webp'
+            if self.config.get("convert_animated_webp_to_gif", True):
+                converted = self._convert_animated_webp_to_gif(buffer)
+                if converted is not None:
+                    buffer, mime, ext = converted, 'image/gif', 'gif'
+        return buffer, mime, ext
 
     def _is_animated_webp(self, buffer: bytes) -> bool:
         """判断 WebP 图片是否为动图（多帧）"""
@@ -293,6 +291,15 @@ class StickerConvert(Star):
 
     async def _extract_image_urls(self, event: AstrMessageEvent, allow_recent: bool = True):
         """从消息、引用的历史消息或近期私聊上下文中提取图片 URL"""
+        if event.get_platform_name() == "telegram":
+            components = list(event.get_messages())
+            for component in event.get_messages():
+                if isinstance(component, Reply):
+                    components.extend(component.chain or [])
+            return [
+                await component.convert_to_file_path()
+                for component in components if isinstance(component, Image)
+            ]
         sender_id = str(event.message_obj.sender.user_id) if hasattr(event.message_obj, "sender") and hasattr(event.message_obj.sender, "user_id") else ""
 
         # 1. 优先提取当前消息自带的图片
@@ -392,6 +399,15 @@ class StickerConvert(Star):
 
     async def _send_as_file(self, event: AstrMessageEvent, buffer: bytes, file_name: str):
         """绕过框架和硬盘隔离，通过 Base64 直接向底层发送纯文件卡片"""
+        if event.get_platform_name() == "telegram":
+            path = Path(self.data_dir) / "tg_out" / Path(file_name).name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(path.write_bytes, buffer)
+            try:
+                await event.send(MessageChain([File(name=path.name, file=str(path))]))
+                return True
+            finally:
+                path.unlink(missing_ok=True)
         if event.get_platform_name() == "aiocqhttp":
             b64_data = base64.b64encode(buffer).decode()
             b64_uri = f"base64://{b64_data}"
